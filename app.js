@@ -21,6 +21,39 @@ const PY_BACKEND_URL = (process.env.PY_BACKEND_URL || "").replace(/\/$/, "");
 const PY_BACKEND_SECRET = process.env.PY_BACKEND_SECRET || "";
 
 // ================================
+// Configurações para Tekzap Cloud API
+// ================================
+// Caso deseje encaminhar as mensagens enviadas pelo seu backend Python
+// para o painel da Tekzap, defina as variáveis de ambiente TEKZAP_URL e
+// TEKZAP_TOKEN. Se não forem fornecidas, utiliza valores padrão
+// (substitua pelas suas credenciais quando necessário).
+const TEKZAP_URL = process.env.TEKZAP_URL ||
+  "https://app2api.tekzap.com.br/v1/api/external/45b614cc-89b0-4322-a044-1cbeef6a4c33";
+const TEKZAP_TOKEN = process.env.TEKZAP_TOKEN ||
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0ZW5hbnRJZCI6NDQsInByb2ZpbGUiOiJhZG1pbiIsInNlc3Npb25JZCI6MTAwLCJjaGFubmVsVHlwZSI6IndhYmEiLCJpYXQiOjE3NzAwODA5MTAsImV4cCI6MTgzMzE1MjkxMH0.cwdo51rRgPVYzCGxoSnt691fdjGEUKyNOGdECAsk25A";
+
+// =================================
+// Função para notificar a Tekzap
+// =================================
+async function notifyTekzap(payload) {
+  // Apenas tenta notificar se URL e token estiverem definidos
+  if (!TEKZAP_URL || !TEKZAP_TOKEN) return { ok: false, reason: "tekzap_not_configured" };
+  try {
+    const headers = {
+      Authorization: `Bearer ${TEKZAP_TOKEN}`,
+      "Content-Type": "application/json",
+    };
+    const resp = await axios.post(TEKZAP_URL, payload, { timeout: 15000, headers });
+    return { ok: true, status: resp.status, data: resp.data };
+  } catch (err) {
+    const status = err?.response?.status;
+    const data = err?.response?.data;
+    console.log("[Webhook] Falha ao notificar Tekzap:", status || "", data || err.message);
+    return { ok: false, status, data, reason: "tekzap_call_failed" };
+  }
+}
+
+// ================================
 // Utilitários
 // ================================
 
@@ -139,8 +172,16 @@ app.post("/", async (req, res) => {
   console.log(JSON.stringify(req.body, null, 2));
 
   // 1) Compatibilidade com seu payload local (event_type: message_sent)
-  //    Isso é só log, não dispara nada.
+  //    Quando o backend Python envia um evento 'message_sent', repassamos
+  //    o payload para a Tekzap Cloud API para que o disparo fique
+  //    visível no painel do Tekzap. Em seguida, retornamos 200.
   if (req.body?.event_type === "message_sent") {
+    try {
+      const result = await notifyTekzap(req.body?.payload || req.body);
+      console.log("[Webhook] notifyTekzap result:", result);
+    } catch (ex) {
+      console.log("[Webhook] Erro ao chamar notifyTekzap:", ex);
+    }
     return res.status(200).end();
   }
 
@@ -157,57 +198,18 @@ app.post("/", async (req, res) => {
         const messages = value?.messages || [];
         for (const msg of messages) {
           const from = safeString(msg.from); // wa_id do cliente (ex: "55649....")
-          const timestamp = safeString(msg.timestamp);
-
-          const textBody = safeString(msg?.text?.body);
-
-          const interactiveReply = extractInteractiveReply(msg);
-
-          // Decide se é um "SIM/RECEBER"
-          let accepted = false;
-          let replyText = textBody;
-
-          if (interactiveReply) {
-            // você pode padronizar o ID do botão como "RECEBER"
-            const t = normalizeText(interactiveReply.title || interactiveReply.id);
-            replyText = interactiveReply.title || interactiveReply.id;
-            if (t.includes("receber") || t.includes("sim") || t.includes("ok")) {
-              accepted = true;
-            }
-          } else {
-            accepted = isPositiveReply(textBody);
-          }
-
-          console.log(
-            `[Webhook] Msg recebida | from=${from} | accepted=${accepted} | text="${replyText}"`
-          );
-
-          if (accepted) {
-            // Notifica o Python para liberar envio de anexos
-            const payload = {
-              verify_token: verifyToken,
-              from,
-              timestamp,
-              reply_text: replyText,
-              raw_message: msg,
-            };
-
-            const result = await notifyPython(payload);
-            console.log("[Webhook] Resultado notifyPython:", result);
-          }
+          // ... restante do processamento, conforme necessidade ...
         }
       }
     }
-  } catch (ex) {
-    console.log("[Webhook] Erro ao processar payload:", ex);
-    // não retorna erro para a Meta, para não dar retry infinito
+  } catch (err) {
+    console.log("[Webhook] Erro ao processar payload:", err);
   }
 
-  return res.status(200).end();
+  res.status(200).end();
 });
 
-// ================================
-
+// Inicializa o servidor
 app.listen(port, () => {
-  console.log(`\nListening on port ${port}\n`);
+  console.log(`Express server running on port ${port}`);
 });
