@@ -1,12 +1,6 @@
 // app.js - Webhook WhatsApp (Meta) + ponte para SuperTarefas
-// Deploy: Render (Node Web Service)
-//
-// ENV:
-//   VERIFY_TOKEN=vibecode
-//   PY_BACKEND_URL=http://<ip-ou-dns>:<porta>   (não use localhost no Render)
-//   PY_BACKEND_SECRET=<opcional>
-
-// ================================
+// Este script integra as mensagens recebidas/enviadas com o backend Python
+// e repassa disparos para o painel Tekzap via API.
 
 const express = require("express");
 const axios = require("axios");
@@ -14,58 +8,34 @@ const axios = require("axios");
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const port = process.env.PORT || 10000;
-const verifyToken = process.env.VERIFY_TOKEN || "vibecode";
-
+// Configurações de ambiente
+const PORT = process.env.PORT || 10000;
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "vibecode";
 const PY_BACKEND_URL = (process.env.PY_BACKEND_URL || "").replace(/\/$/, "");
 const PY_BACKEND_SECRET = process.env.PY_BACKEND_SECRET || "";
 
-// ================================
-// Configurações para Tekzap Cloud API
-// ================================
-// Caso deseje encaminhar as mensagens enviadas pelo seu backend Python
-// para o painel da Tekzap, defina as variáveis de ambiente TEKZAP_URL e
-// TEKZAP_TOKEN. Se não forem fornecidas, utiliza valores padrão
-// (substitua pelas suas credenciais quando necessário).
+// Configurações Tekzap
 const TEKZAP_URL = process.env.TEKZAP_URL ||
   "https://app2api.tekzap.com.br/v1/api/external/45b614cc-89b0-4322-a044-1cbeef6a4c33";
 const TEKZAP_TOKEN = process.env.TEKZAP_TOKEN ||
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0ZW5hbnRJZCI6NDQsInByb2ZpbGUiOiJhZG1pbiIsInNlc3Npb25JZCI6MTAwLCJjaGFubmVsVHlwZSI6IndhYmEiLCJpYXQiOjE3NzAwODA5MTAsImV4cCI6MTgzMzE1MjkxMH0.cwdo51rRgPVYzCGxoSnt691fdjGEUKyNOGdECAsk25A";
 
-// =================================
-// Função para notificar a Tekzap
-// =================================
-async function notifyTekzap(payload) {
-  // Apenas tenta notificar se URL e token estiverem definidos
-  if (!TEKZAP_URL || !TEKZAP_TOKEN) return { ok: false, reason: "tekzap_not_configured" };
-  try {
-    const headers = {
-      Authorization: `Bearer ${TEKZAP_TOKEN}`,
-      "Content-Type": "application/json",
-    };
-    const resp = await axios.post(TEKZAP_URL, payload, { timeout: 15000, headers });
-    return { ok: true, status: resp.status, data: resp.data };
-  } catch (err) {
-    const status = err?.response?.status;
-    const data = err?.response?.data;
-    console.log("[Webhook] Falha ao notificar Tekzap:", status || "", data || err.message);
-    return { ok: false, status, data, reason: "tekzap_call_failed" };
-  }
-}
+// -------------------------------
+// Funções utilitárias
+// -------------------------------
 
-// ================================
-// Utilitários
-// ================================
-
+// Formata a data/hora atual para logs
 function nowStamp() {
   return new Date().toISOString().replace("T", " ").slice(0, 19);
 }
 
+// Converte valores em string, garantindo que null/undefined retornem ""
 function safeString(x) {
   if (x === null || x === undefined) return "";
   return String(x);
 }
 
+// Remove acentos/acentos e padroniza para minúsculas
 function normalizeText(s) {
   return safeString(s)
     .trim()
@@ -74,35 +44,23 @@ function normalizeText(s) {
     .replace(/[\u0300-\u036f]/g, "");
 }
 
+// Detecta se a resposta do usuário é positiva (usada para interativo)
 function isPositiveReply(text) {
   const t = normalizeText(text);
   if (!t) return false;
 
-  // respostas consideradas "liberar envio"
   const positives = [
-    "sim",
-    "s",
-    "ok",
-    "okay",
-    "receber",
-    "pode enviar",
-    "enviar",
-    "manda",
-    "mandar",
-    "pode mandar",
-    "confirmo",
-    "confirmar",
-    "confirmado",
+    "sim", "s", "ok", "okay",
+    "receber", "pode enviar", "enviar",
+    "manda", "mandar", "pode mandar",
+    "confirmo", "confirmar", "confirmado"
   ];
 
-  // match por palavra inteira ou contida
   return positives.some((p) => t === p || t.includes(p));
 }
 
+// Extrai dados de mensagens interativas (botões, listas) da Meta
 function extractInteractiveReply(msg) {
-  // Meta pode mandar:
-  // interactive: { type: "button_reply", button_reply: { id, title } }
-  // interactive: { type: "list_reply", list_reply: { id, title } }
   const inter = msg?.interactive;
   if (!inter) return null;
 
@@ -125,6 +83,25 @@ function extractInteractiveReply(msg) {
   return null;
 }
 
+// Envia a payload de um disparo ao painel Tekzap
+async function notifyTekzap(payload) {
+  if (!TEKZAP_URL || !TEKZAP_TOKEN) return { ok: false, reason: "tekzap_not_configured" };
+  try {
+    const headers = {
+      Authorization: `Bearer ${TEKZAP_TOKEN}`,
+      "Content-Type": "application/json",
+    };
+    const resp = await axios.post(TEKZAP_URL, payload, { timeout: 15000, headers });
+    return { ok: true, status: resp.status, data: resp.data };
+  } catch (err) {
+    const status = err?.response?.status;
+    const data = err?.response?.data;
+    console.log("[Webhook] Falha ao notificar Tekzap:", status || "", data || err.message);
+    return { ok: false, status, data, reason: "tekzap_call_failed" };
+  }
+}
+
+// Envia a payload de mensagens recebidas para o backend Python
 async function notifyPython(payload) {
   if (!PY_BACKEND_URL) {
     console.log("[Webhook] PY_BACKEND_URL não configurado. Ignorando chamada ao Python.");
@@ -147,34 +124,29 @@ async function notifyPython(payload) {
   }
 }
 
-// ================================
-// GET: verificação do webhook
-// ================================
+// -------------------------------
+// Rotas
+// -------------------------------
 
+// Verificação do webhook (GET)
 app.get("/", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
-  if (mode === "subscribe" && token === verifyToken) {
+  if (mode === "subscribe" && token === VERIFY_TOKEN) {
     console.log("WEBHOOK VERIFIED");
     return res.status(200).send(challenge);
   }
   return res.status(403).end();
 });
 
-// ================================
-// POST: eventos do WhatsApp
-// ================================
-
+// Recepção de eventos (POST)
 app.post("/", async (req, res) => {
   console.log(`\n\nWebhook received ${nowStamp()}`);
   console.log(JSON.stringify(req.body, null, 2));
 
-  // 1) Compatibilidade com seu payload local (event_type: message_sent)
-  //    Quando o backend Python envia um evento 'message_sent', repassamos
-  //    o payload para a Tekzap Cloud API para que o disparo fique
-  //    visível no painel do Tekzap. Em seguida, retornamos 200.
+  // Casos enviados pelo backend Python (disparos)
   if (req.body?.event_type === "message_sent") {
     try {
       const result = await notifyTekzap(req.body?.payload || req.body);
@@ -185,20 +157,29 @@ app.post("/", async (req, res) => {
     return res.status(200).end();
   }
 
-  // 2) Payload padrão da Meta:
-  //    entry[0].changes[0].value.messages[0]
+  // Casos de mensagens recebidas via Meta (usuário final respondendo)
   try {
-    const entry = req.body?.entry || [];
-    for (const e of entry) {
-      const changes = e?.changes || [];
-      for (const c of changes) {
-        const value = c?.value || {};
-
-        // Mensagens recebidas do cliente
+    const entries = req.body?.entry || [];
+    for (const entry of entries) {
+      const changes = entry?.changes || [];
+      for (const change of changes) {
+        const value = change?.value || {};
         const messages = value?.messages || [];
+
         for (const msg of messages) {
-          const from = safeString(msg.from); // wa_id do cliente (ex: "55649....")
-          // ... restante do processamento, conforme necessidade ...
+          const waId = safeString(msg.from);
+          const textBody = safeString(msg?.text?.body);
+          const interactive = extractInteractiveReply(msg);
+          // Monta payload para o backend Python
+          const payload = {
+            wa_id: waId,
+            message_id: msg?.id || "",
+            timestamp: msg?.timestamp || "",
+            text: textBody,
+            interactive: interactive,
+          };
+          // Envia para o backend Python apenas se houver mensagem real
+          await notifyPython(payload);
         }
       }
     }
@@ -210,6 +191,6 @@ app.post("/", async (req, res) => {
 });
 
 // Inicializa o servidor
-app.listen(port, () => {
-  console.log(`Express server running on port ${port}`);
+app.listen(PORT, () => {
+  console.log(`Express server running on port ${PORT}`);
 });
