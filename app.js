@@ -2,10 +2,7 @@
 //
 // Este servidor Node.js é responsável por receber webhooks do WhatsApp
 // Cloud API (Meta) e da plataforma Tekzap, repassar eventos para o
-// backend Python quando necessário e registrar disparos no Tekzap. Ele
-// funciona em ambiente Render, portanto todo o roteamento ocorre aqui,
-// dispensando a necessidade de executar um servidor adicional em
-// Python para tratar webhooks.
+// backend Python quando necessário e registrar disparos no Tekzap.
 //
 // Principais funcionalidades:
 //
@@ -20,8 +17,6 @@
 //   que uma conversa está ativa.
 // - Funções utilitárias para detecção de respostas positivas,
 //   normalização de texto e extração de dados de mensagens interativas.
-//
-// Dependências: express, axios
 
 const express = require('express');
 const axios = require('axios');
@@ -36,14 +31,15 @@ const PORT = process.env.PORT || 10000;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'vibecode';
 
 // Endpoint do backend Python. Deve apontar para o serviço Python que
-// processa interações (por exemplo, http://localhost:5000). Não use
-// barra ao final; será concatenado com '/whatsapp/webhook-reply'.
+// processa interações (por exemplo, http://localhost:5000). Se não
+// desejar repassar eventos ao Python (porque ele não está exposto),
+// deixe PY_BACKEND_URL vazio.
 const PY_BACKEND_URL = (process.env.PY_BACKEND_URL || '').replace(/\/$/, '');
 const PY_BACKEND_SECRET = process.env.PY_BACKEND_SECRET || '';
 
-// Configurações da Tekzap Cloud API. Estes valores são utilizados para
-// registrar disparos realizados via Meta no painel da Tekzap. Se
-// deixados vazios, as chamadas de notificação ao Tekzap são ignoradas.
+// Configurações da Tekzap Cloud API. Defina TEKZAP_URL e TEKZAP_TOKEN
+// nas variáveis de ambiente para registrar disparos realizados via
+// Meta no painel da Tekzap.
 const TEKZAP_URL = process.env.TEKZAP_URL || '';
 const TEKZAP_TOKEN = process.env.TEKZAP_TOKEN || '';
 
@@ -68,8 +64,7 @@ function normalizeText(s) {
 
 // Retorna true se a resposta do cliente indica que ele deseja receber
 // ("sim", "ok", "pode enviar", etc.). Pode ser usado no modo
-// interativo para decidir quando liberar anexos. Se o modo interativo
-// exige confirmação, utilize esta função; caso contrário, sempre envie.
+// interativo para decidir quando liberar anexos.
 function isPositiveReply(text) {
   const t = normalizeText(text);
   if (!t) return false;
@@ -118,7 +113,6 @@ function extractInteractiveReply(msg) {
 // ---------------------------------------------------------------
 async function notifyPython(payload) {
   if (!PY_BACKEND_URL) {
-    console.log('[Webhook] PY_BACKEND_URL não definido. Ignorando notifyPython');
     return;
   }
   const url = `${PY_BACKEND_URL}/whatsapp/webhook-reply`;
@@ -173,9 +167,7 @@ app.get('/', (req, res) => {
 app.post('/', async (req, res) => {
   // Caso seja um evento enviado pelo nosso backend Python para
   // registrar um disparo (event_type: message_sent), repassamos à
-  // Tekzap (caso configurado) e retornamos 200. O payload enviado
-  // pelo Python deverá conter as informações da mensagem enviada
-  // (messaging_product, to, template, etc.).
+  // Tekzap (caso configurado) e retornamos 200.
   if (req.body?.event_type === 'message_sent') {
     try {
       await notifyTekzap(req.body?.payload || req.body);
@@ -190,8 +182,7 @@ app.post('/', async (req, res) => {
     try {
       const event = req.body.event;
       const msg = req.body.message;
-      // NewMessage indica uma nova mensagem recebida do cliente. Se
-      // fromMe for false, significa que a mensagem veio do cliente.
+      // NewMessage indica uma nova mensagem recebida do cliente.
       if (event === 'NewMessage' && msg.fromMe === false) {
         let number = '';
         // Extrai o número do contato ou do raw.from
@@ -221,10 +212,8 @@ app.post('/', async (req, res) => {
   }
 
   // Eventos padrão da Meta. A estrutura usual é:
-  // {
-  //   "object": "whatsapp_business_account",
-  //   "entry": [ { "changes": [ { "value": { ... } } ] } ]
-  // }
+  // { "object": "whatsapp_business_account",
+  //   "entry": [ { "changes": [ { "value": { ... } } ] } ] }
   try {
     const entries = req.body?.entry || [];
     for (const entry of entries) {
