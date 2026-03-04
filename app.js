@@ -21,6 +21,7 @@ const axios = require("axios");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
 // --- CONFIGURAÇÕES ---
 const PORT = process.env.PORT || 10000;
@@ -59,6 +60,18 @@ function normalizeNumber(n) {
 
 function safeLower(s) {
   return (s || "").toString().trim().toLowerCase();
+}
+
+
+function asTriBool(v) {
+  if (v === true || v === 1 || v === "1") return true;
+  if (v === false || v === 0 || v === "0") return false;
+  if (typeof v === "string") {
+    const s = v.trim().toLowerCase();
+    if (s === "true") return true;
+    if (s === "false") return false;
+  }
+  return null;
 }
 
 // Dedupe forte e estável
@@ -118,7 +131,7 @@ function pushNotification(summary, payload) {
 
 function extractTekzapInboundNumber(content) {
   // compat com seu código atual + variações
-  const msg = content?.message;
+  const msg = content?.message || content?.data?.message || content?.data?.msg || content?.msg;
   if (!msg) return null;
 
   let number =
@@ -292,22 +305,32 @@ async function processWebhook(content) {
     // -------------------------
     // CENÁRIO 1: TEKZAP
     // -------------------------
-    if (content && typeof content === "object" && content.event) {
-      const event = String(content.event);
+    if (content && typeof content === "object" && (content.event || content.data?.event || content.event_type || content.eventType || content.type)) {
+      const eventRaw = content.event || content.data?.event || content.event_type || content.eventType || content.type || content.data?.type;
+      const event = String(eventRaw || "");
 
       // 1A) MANTIDO: Interações p/ automations (somente NewMessage inbound)
-      if (event === "NewMessage" && content.message) {
-        const msg = content.message;
 
-        // Só processamos se NÃO fui eu que enviei (fromMe: false)
-        if (msg.fromMe === false) {
-          const number = extractTekzapInboundNumber(content);
-          if (number) {
-            console.log(`[TEKZAP] Cliente ${number} respondeu. Salvando na fila.`);
-            pendingReplies.add(number);
-          }
-        }
-      }
+const eventNorm = safeLower(event);
+const isNewMsg =
+  eventNorm === "newmessage" ||
+  eventNorm === "new_message" ||
+  eventNorm.includes("newmessage");
+
+const msg = content.message || content.data?.message || content.data?.msg || content.msg;
+
+if (isNewMsg && msg) {
+  // Só processamos se NÃO fui eu que enviei (fromMe: false)
+  const fromMeVal = msg.fromMe ?? msg.from_me ?? msg.fromme ?? msg.fromME;
+  const tri = asTriBool(fromMeVal);
+  if (tri === false) {
+    const number = extractTekzapInboundNumber(content);
+    if (number) {
+      console.log(`[TEKZAP] Cliente ${number} respondeu. Salvando na fila.`);
+      pendingReplies.add(number);
+    }
+  }
+}
 
       // 1B) NOVO: Notificações completas (ticket events + NewMessage inbound)
       const ticketEvents = new Set([
@@ -317,10 +340,10 @@ async function processWebhook(content) {
         "UpdateOnTicket",
         "FinishedTicket",
         "FinishedTicketHistoricMessages",
-      ]);
+      ].map(safeLower));
 
       // 1B.1) Eventos com ticket completo
-      if (ticketEvents.has(event) && content.ticket) {
+      if (ticketEvents.has(eventNorm) && content.ticket) {
         const t = extractTekzapTicket(content);
         const tenantId = content.tenantId ?? t.tenantId ?? null;
 
@@ -329,7 +352,7 @@ async function processWebhook(content) {
         const isPending = !userEmail;
 
         // filtro leve: UpdateOnTicket só se tiver "sinal" de novidade
-        if (event === "UpdateOnTicket") {
+        if (eventNorm === "updateonticket") {
           const unreadFlag = t.unread === true || (t.unreadMessages || 0) > 0;
           if (!unreadFlag) return;
         }
