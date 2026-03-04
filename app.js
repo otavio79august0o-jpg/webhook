@@ -21,7 +21,7 @@ const axios = require("axios");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+app.use(express.urlencoded({ extended: true }));
 
 // --- CONFIGURAÇÕES ---
 const PORT = process.env.PORT || 10000;
@@ -40,12 +40,30 @@ const NOTIF_MAX = parseInt(process.env.NOTIF_MAX || "2000", 10);
 
 // --- MEMÓRIA TEMPORÁRIA (A CAIXA DE CORREIO) ---
 // 1) Interações (mantido): números que responderam, para automations/serviços do Python
-let pendingReplies = new Set();
+let pendingReplies = []; // [{unique_key, number, received_at, payload}]
+let replySeenKeys = new Set();
 
 // 2) Notificações (novo): eventos completos, para o SuperTarefas salvar no banco local
 let pendingNotifications = []; // [{id, created_at, delivered_at, summary, payload}]
 let notifSeenKeys = new Set(); // dedupe por unique_key
 let ticketCache = new Map();   // cache simples por ticketId p/ enriquecer NewMessage
+
+function isFalseyBoolean(v) {
+  // aceita: false, "false", 0, "0", "no", "off"
+  if (v === false) return true;
+  if (v === true) return false;
+  if (v == null) return false;
+  const s = String(v).trim().toLowerCase();
+  return s === "false" || s === "0" || s === "no" || s === "off";
+}
+
+function isTruthyBoolean(v) {
+  if (v === true) return true;
+  if (v === false) return false;
+  if (v == null) return false;
+  const s = String(v).trim().toLowerCase();
+  return s === "true" || s === "1" || s === "yes" || s === "on";
+}
 
 // --- FUNÇÕES AUXILIARES ---
 
@@ -60,18 +78,6 @@ function normalizeNumber(n) {
 
 function safeLower(s) {
   return (s || "").toString().trim().toLowerCase();
-}
-
-
-function asTriBool(v) {
-  if (v === true || v === 1 || v === "1") return true;
-  if (v === false || v === 0 || v === "0") return false;
-  if (typeof v === "string") {
-    const s = v.trim().toLowerCase();
-    if (s === "true") return true;
-    if (s === "false") return false;
-  }
-  return null;
 }
 
 // Dedupe forte e estável
@@ -131,13 +137,14 @@ function pushNotification(summary, payload) {
 
 function extractTekzapInboundNumber(content) {
   // compat com seu código atual + variações
-  const msg = content?.message || content?.data?.message || content?.data?.msg || content?.msg;
+  const msg = content?.message;
   if (!msg) return null;
 
   let number =
     msg.number ||
     msg.chatId ||
     (msg.contact ? msg.contact.number : null) ||
+    (msg.ticket && msg.ticket.contact ? msg.ticket.contact.number : null) ||
     (msg.raw ? msg.raw.from : null);
 
   if (!number && content?.ticket?.contact?.number) {
@@ -169,6 +176,8 @@ async function notifyTekzap(payload) {
 
 // Token opcional (se PYTHON_TOKEN vazio, fica aberto)
 function requirePythonToken(req, res, next) {
+  // Se PYTHON_TOKEN estiver vazio, mantém aberto (modo atual).
+  // Se estiver preenchido, aceita PYTHON_TOKEN OU VERIFY_TOKEN (vibecode) para evitar mismatch.
   if (!PYTHON_TOKEN) return next();
 
   const auth = req.headers["authorization"] || "";
@@ -176,9 +185,11 @@ function requirePythonToken(req, res, next) {
   const q = req.query?.token || "";
 
   const bearer = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
-  const provided = bearer || x || q;
+  const provided = bearer || x || q || auth;
 
-  if (provided && provided === PYTHON_TOKEN) return next();
+  const allowed = new Set([PYTHON_TOKEN, VERIFY_TOKEN].filter(Boolean));
+  if (provided && allowed.has(String(provided).trim())) return next();
+
   return res.status(401).json({ error: "unauthorized" });
 }
 
@@ -215,24 +226,31 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     time: nowIso(),
-    replies_pending: pendingReplies.size,
+    replies_pending: pendingReplies.length,
     notifications_pending: pendingNotifications.filter((n) => !n.delivered_at).length,
   });
 });
 
 // 3. Rota para o Python buscar interações (MANTIDO - mesmo contrato)
 app.get("/check-replies", (req, res) => {
-  const repliesToSend = Array.from(pendingReplies);
+  // Entrega em lote: itens completos (com payload) + lista de numbers (compat).
+  const items = pendingReplies.slice(0);
 
-  // Se entregamos as mensagens, limpamos a caixa de correio
-  if (repliesToSend.length > 0) {
-    console.log(`[PYTHON] Entregando ${repliesToSend.length} interações para o Python.`);
-    pendingReplies.clear();
+  if (items.length > 0) {
+    console.log(`[PYTHON] Entregando ${items.length} interação(ões) para o Python.`);
+    // limpa caixa de correio e dedupe
+    for (const it of items) {
+      if (it?.unique_key) replySeenKeys.delete(it.unique_key);
+    }
+    pendingReplies = [];
   }
 
+  const numbers = items.map((i) => i.number).filter(Boolean);
+
   res.json({
-    count: repliesToSend.length,
-    numbers: repliesToSend,
+    count: items.length,
+    numbers,
+    items: items.map((i) => ({ number: i.number, payload: i.payload, received_at: i.received_at })),
   });
 });
 
@@ -305,29 +323,36 @@ async function processWebhook(content) {
     // -------------------------
     // CENÁRIO 1: TEKZAP
     // -------------------------
-    if (content && typeof content === "object" && (content.event || content.data?.event || content.event_type || content.eventType || content.type)) {
-      const eventRaw = content.event || content.data?.event || content.event_type || content.eventType || content.type || content.data?.type;
-      const event = String(eventRaw || "");
+    if (content && typeof content === "object" && content.event) {
+      const event = String(content.event);
 
-      // 1A) MANTIDO: Interações p/ automations (somente NewMessage inbound)
+      // 1A) Interações p/ automations (NewMessage inbound)
+// Agora guardamos o payload inteiro para o Python salvar como JSON local.
+if (event === "NewMessage" && content.message) {
+  const msg = content.message;
 
-const eventNorm = safeLower(event);
-const isNewMsg =
-  eventNorm === "newmessage" ||
-  eventNorm === "new_message" ||
-  eventNorm.includes("newmessage");
-
-const msg = content.message || content.data?.message || content.data?.msg || content.msg;
-
-if (isNewMsg && msg) {
-  // Só processamos se NÃO fui eu que enviei (fromMe: false)
-  const fromMeVal = msg.fromMe ?? msg.from_me ?? msg.fromme ?? msg.fromME;
-  const tri = asTriBool(fromMeVal);
-  if (tri === false) {
+  // Só processamos se NÃO fui eu que enviei
+  if (isFalseyBoolean(msg.fromMe)) {
     const number = extractTekzapInboundNumber(content);
     if (number) {
-      console.log(`[TEKZAP] Cliente ${number} respondeu. Salvando na fila.`);
-      pendingReplies.add(number);
+      const tenantId = content.tenantId ?? msg.tenantId ?? null;
+      const ticketId = msg.ticketId ?? null;
+      const messageId = msg.messageId || msg.id || null;
+      const sourceTs = msg.msgCreatedAt || msg.timestamp || msg.createdAt || null;
+
+      const unique_key = makeUniqueKey({
+        event: "reply",
+        tenantId,
+        ticketId,
+        messageId,
+        sourceTs,
+      });
+
+      if (!replySeenKeys.has(unique_key)) {
+        console.log(`[TEKZAP] Cliente ${number} respondeu. Salvando na fila (reply).`);
+        pendingReplies.push({ unique_key, number, received_at: nowIso(), payload: content });
+        replySeenKeys.add(unique_key);
+      }
     }
   }
 }
@@ -340,10 +365,10 @@ if (isNewMsg && msg) {
         "UpdateOnTicket",
         "FinishedTicket",
         "FinishedTicketHistoricMessages",
-      ].map(safeLower));
+      ]);
 
       // 1B.1) Eventos com ticket completo
-      if (ticketEvents.has(eventNorm) && content.ticket) {
+      if (ticketEvents.has(event) && content.ticket) {
         const t = extractTekzapTicket(content);
         const tenantId = content.tenantId ?? t.tenantId ?? null;
 
@@ -351,13 +376,18 @@ if (isNewMsg && msg) {
         const userEmail = t.user?.email ? safeLower(t.user.email) : null;
         const isPending = !userEmail;
 
-        // filtro leve: UpdateOnTicket só se tiver "sinal" de novidade
-        if (eventNorm === "updateonticket") {
-          const unreadFlag = t.unread === true || (t.unreadMessages || 0) > 0;
-          if (!unreadFlag) return;
-        }
+        // UpdateOnTicket: aceita se houver mudança relevante
+if (event === "UpdateOnTicket") {
+  const statusChanged = t.oldStatus && t.status && String(t.oldStatus) !== String(t.status);
+  const unreadFlag = t.unread === true || (t.unreadMessages || 0) > 0;
+  const userChanged = (t.userId != null && t.user && t.user.id != null) ? false : false; // placeholder (mantém compat)
+  if (!statusChanged && !unreadFlag) {
+    // sem mudança relevante -> ignora
+    return;
+  }
+}
 
-        // cache para enriquecer NewMessage (quando o ticket event chegar antes)
+// cache para enriquecer NewMessage (quando o ticket event chegar antes)
         if (t.id != null) {
           ticketCache.set(String(t.id), {
             user_email: userEmail,
@@ -406,7 +436,7 @@ if (isNewMsg && msg) {
       if (event === "NewMessage" && content.message) {
         const msg = content.message;
 
-        if (msg.fromMe === false) {
+        if (isFalseyBoolean(msg.fromMe)) {
           const tenantId = content.tenantId ?? msg.tenantId ?? null;
           const ticketIdRaw = msg.ticketId ?? null;
           const ticketId = ticketIdRaw != null ? String(ticketIdRaw) : null;
@@ -467,7 +497,11 @@ if (isNewMsg && msg) {
             if (msg.from) {
               const number = String(msg.from).replace(/\D/g, "");
               console.log(`[META] Cliente ${number} respondeu. Salvando na fila.`);
-              pendingReplies.add(number);
+              const unique_key = `meta|${number}|${msg.id || msg.timestamp || Date.now()}`;
+              if (!replySeenKeys.has(unique_key)) {
+                pendingReplies.push({ unique_key, number, received_at: nowIso(), payload: content });
+                replySeenKeys.add(unique_key);
+              }
             }
           }
         }
