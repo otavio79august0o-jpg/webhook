@@ -47,6 +47,7 @@ const NOTIF_MAX = parseInt(process.env.NOTIF_MAX || "2000", 10);
 
 const AGENT_TTL_HOURS = parseInt(process.env.AGENT_TTL_HOURS || "72", 10);
 const AGENT_MAX = parseInt(process.env.AGENT_MAX || "2000", 10);
+const ACTIVE_CLIENT_TTL_MINUTES = parseInt(process.env.ACTIVE_CLIENT_TTL_MINUTES || "10", 10);
 
 // --- PERSISTÊNCIA (DISCO) ---
 const STORE_DIR = process.env.STORE_DIR || path.join(__dirname, "store");
@@ -98,6 +99,9 @@ let agentSeenKeys = new Set(
 // Cache simples por ticketId p/ enriquecer NewMessage
 let ticketCache = new Map();
 
+// Viewers ativos das notificações compartilhadas (user_email ou client_id)
+let activeNotifViewers = new Map();
+
 // --- HELPERS ---
 function nowIso() {
   return new Date().toISOString();
@@ -140,6 +144,124 @@ function stableHash(obj) {
   } catch (_) {
     return String(Date.now());
   }
+}
+
+function normalizeStringArray(value) {
+  if (!Array.isArray(value)) return [];
+  return Array.from(
+    new Set(
+      value
+        .map((v) => (v == null ? "" : String(v).trim()))
+        .filter(Boolean)
+    )
+  );
+}
+
+function makeViewerKey(userEmail, clientId) {
+  const client = safeLower(clientId);
+  const email = safeLower(userEmail);
+  if (client) return `client:${client}`;
+  if (email) return `user:${email}`;
+  return null;
+}
+
+function cleanupNotifViewers() {
+  const cutoff = Date.now() - ACTIVE_CLIENT_TTL_MINUTES * 60 * 1000;
+  for (const [key, info] of activeNotifViewers.entries()) {
+    const t = Date.parse(info?.updated_at || "") || 0;
+    if (t < cutoff) activeNotifViewers.delete(key);
+  }
+}
+
+function touchNotifViewer(userEmail, clientId) {
+  const key = makeViewerKey(userEmail, clientId);
+  if (!key) return null;
+
+  activeNotifViewers.set(key, {
+    key,
+    user_email: safeLower(userEmail) || null,
+    client_id: safeLower(clientId) || null,
+    updated_at: nowIso(),
+  });
+  return key;
+}
+
+function getActiveNotifViewerKeys() {
+  cleanupNotifViewers();
+  return Array.from(activeNotifViewers.keys());
+}
+
+function getNotificationAudience(item) {
+  item.audience = normalizeStringArray(item?.audience);
+  return item.audience;
+}
+
+function getNotificationAckedBy(item) {
+  item.acked_by = normalizeStringArray(item?.acked_by);
+  return item.acked_by;
+}
+
+function ensureNotificationAudience(item, viewerKey) {
+  if (!item) return false;
+
+  const audience = getNotificationAudience(item);
+
+  if (item?.summary?.is_pending === true) {
+    if (audience.length > 0) return false;
+
+    const active = getActiveNotifViewerKeys();
+    if (viewerKey && !active.includes(viewerKey)) active.unshift(viewerKey);
+
+    item.audience = normalizeStringArray(active);
+    return item.audience.length > 0;
+  }
+
+  const target = makeViewerKey(item?.summary?.user_email, null) || viewerKey || null;
+  if (!target || audience.includes(target)) return false;
+
+  audience.push(target);
+  item.audience = normalizeStringArray(audience);
+  return true;
+}
+
+function hasViewerAckedNotification(item, viewerKey) {
+  if (!item || !viewerKey) return false;
+  const ackedBy = getNotificationAckedBy(item);
+  return ackedBy.includes(viewerKey);
+}
+
+function isNotificationFullyAcked(item) {
+  if (!item) return false;
+
+  const audience = getNotificationAudience(item);
+  const ackedBy = new Set(getNotificationAckedBy(item));
+
+  if (audience.length === 0) {
+    return !!item.delivered_at;
+  }
+
+  return audience.every((key) => ackedBy.has(key));
+}
+
+function markNotificationAcked(item, viewerKey) {
+  if (!item || !viewerKey) return false;
+
+  let changed = false;
+  if (ensureNotificationAudience(item, viewerKey)) changed = true;
+
+  const ackedBy = new Set(getNotificationAckedBy(item));
+  if (!ackedBy.has(viewerKey)) {
+    ackedBy.add(viewerKey);
+    item.acked_by = Array.from(ackedBy);
+    changed = true;
+  }
+
+  if (isNotificationFullyAcked(item) && !item.delivered_at) {
+    item.delivered_at = nowIso();
+    changed = true;
+  }
+
+  return changed;
 }
 
 function cleanupReplies() {
@@ -226,6 +348,8 @@ function pushNotification(summary, payload) {
     id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
     created_at: nowIso(),
     delivered_at: null,
+    audience: summary?.is_pending === true ? [] : normalizeStringArray([makeViewerKey(summary?.user_email, null)]),
+    acked_by: [],
     summary,
     payload,
   };
@@ -371,12 +495,14 @@ app.get("/health", (_req, res) => {
   cleanupReplies();
   cleanupNotifications();
   cleanupAgentMessages();
+  cleanupNotifViewers();
   res.json({
     ok: true,
     time: nowIso(),
     replies_pending: pendingReplies.filter((r) => !r.delivered_at).length,
     notifications_pending: pendingNotifications.filter((n) => !n.delivered_at).length,
     agent_messages_pending: pendingAgentMessages.filter((n) => !n.delivered_at).length,
+    notification_viewers_active: activeNotifViewers.size,
   });
 });
 
@@ -452,11 +578,18 @@ app.post("/ack-replies", requirePythonToken, (req, res) => {
   }
 });
 
-// Python busca NOTIFICAÇÕES completas (igual ao seu app anterior)
+// Python busca NOTIFICAÇÕES completas
+// Compatibilidade:
+//  - sem peek: faz auto-ack do viewer atual
+//  - com peek=1: apenas lê; depois o Python pode confirmar em /ack-notifications
 app.get("/check-notifications", requirePythonToken, (req, res) => {
   cleanupNotifications();
+  cleanupNotifViewers();
 
-  const userEmail = safeLower(req.query.user_email);
+  const userEmail = safeLower(req.query.user_email || req.query.userEmail || req.query.email);
+  const clientId = safeLower(req.query.client_id || req.query.clientId || req.query.machine_id || req.query.machineId);
+  const viewerKey = touchNotifViewer(userEmail, clientId);
+
   const mode = (req.query.mode || "my").toString();
   const limit = Math.max(1, Math.min(parseInt(req.query.limit || "100", 10), 500));
   const peek = req.query.peek === "1" || req.query.peek === "true";
@@ -472,21 +605,93 @@ app.get("/check-notifications", requirePythonToken, (req, res) => {
         return s.is_pending === true || safeLower(s.user_email) === userEmail;
       });
     }
-  } // all: sem filtro
+  } // all: sem filtro adicional
+
+  if (viewerKey) {
+    items = items.filter((n) => !hasViewerAckedNotification(n, viewerKey));
+  }
 
   items = items.slice(0, limit);
 
-  const deliveredAt = nowIso();
+  let changed = false;
+  for (const n of items) {
+    if (ensureNotificationAudience(n, viewerKey)) changed = true;
+  }
+
   if (!peek) {
-    for (const n of items) n.delivered_at = deliveredAt;
+    for (const n of items) {
+      if (viewerKey) {
+        if (markNotificationAcked(n, viewerKey)) changed = true;
+      } else if (!n.delivered_at) {
+        n.delivered_at = nowIso();
+        changed = true;
+      }
+    }
+  }
+
+  if (changed) {
     saveJsonFile(NOTIFS_FILE, pendingNotifications);
   }
 
   res.json({
     count: items.length,
-    delivered_at: peek ? null : deliveredAt,
+    delivered_at: !peek && viewerKey ? nowIso() : null,
+    viewer_key: viewerKey,
     items,
   });
+});
+
+app.post("/ack-notifications", requirePythonToken, (req, res) => {
+  try {
+    cleanupNotifications();
+    cleanupNotifViewers();
+
+    const body = req.body || {};
+    const userEmail = safeLower(body.user_email || body.userEmail || body.email || req.query.user_email || req.query.email);
+    const clientId = safeLower(body.client_id || body.clientId || body.machine_id || body.machineId || req.query.client_id);
+    const viewerKey = touchNotifViewer(userEmail, clientId);
+
+    const keys = body.unique_keys || body.keys || [];
+    const ids = body.ids || [];
+
+    const keySet = new Set((Array.isArray(keys) ? keys : []).map(String));
+    const idSet = new Set((Array.isArray(ids) ? ids : []).map(String));
+
+    if (!viewerKey) {
+      return res.status(400).json({ error: "viewer_required" });
+    }
+
+    if (keySet.size === 0 && idSet.size === 0) {
+      return res.json({ acked: 0, fully_delivered: 0, viewer_key: viewerKey });
+    }
+
+    let acked = 0;
+    let fullyDelivered = 0;
+    let changed = false;
+
+    for (const item of pendingNotifications) {
+      const key = item?.summary?.unique_key ? String(item.summary.unique_key) : "";
+      const id = item?.id ? String(item.id) : "";
+      const hit = (key && keySet.has(key)) || (id && idSet.has(id));
+      if (!hit) continue;
+
+      const wasAcked = hasViewerAckedNotification(item, viewerKey);
+      const wasDelivered = !!item.delivered_at;
+
+      if (markNotificationAcked(item, viewerKey)) changed = true;
+
+      if (!wasAcked && hasViewerAckedNotification(item, viewerKey)) acked += 1;
+      if (!wasDelivered && item.delivered_at) fullyDelivered += 1;
+    }
+
+    if (changed) {
+      saveJsonFile(NOTIFS_FILE, pendingNotifications);
+    }
+
+    return res.json({ acked, fully_delivered: fullyDelivered, viewer_key: viewerKey });
+  } catch (e) {
+    return res.status(400).json({ error: "bad_request", detail: String(e?.message || e) });
+  }
 });
 
 // Python busca MENSAGENS HUMANAS DO ATENDENTE (com ACK opcional)
@@ -829,6 +1034,7 @@ setInterval(() => {
     cleanupReplies();
     cleanupNotifications();
     cleanupAgentMessages();
+    cleanupNotifViewers();
   } catch (_) {}
 }, 10 * 60 * 1000);
 
@@ -836,6 +1042,6 @@ app.listen(PORT, () => {
   ensureStoreDir();
   console.log(`🚀 Servidor rodando na porta ${PORT}`);
   console.log(`📨 Replies: /check-replies (suporta ACK em /ack-replies)`);
-  console.log(`🔔 Notificações: /check-notifications (token opcional via PYTHON_TOKEN)`);
+  console.log(`🔔 Notificações: /check-notifications e /ack-notifications (token opcional via PYTHON_TOKEN)`);
   console.log(`👤 Atendente: /check-agent-messages (suporta ACK em /ack-agent-messages)`);
 });
