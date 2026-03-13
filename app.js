@@ -45,10 +45,14 @@ const REPLY_MAX = parseInt(process.env.REPLY_MAX || "5000", 10);
 const NOTIF_TTL_HOURS = parseInt(process.env.NOTIF_TTL_HOURS || "72", 10);
 const NOTIF_MAX = parseInt(process.env.NOTIF_MAX || "2000", 10);
 
+const AGENT_TTL_HOURS = parseInt(process.env.AGENT_TTL_HOURS || "72", 10);
+const AGENT_MAX = parseInt(process.env.AGENT_MAX || "2000", 10);
+
 // --- PERSISTÊNCIA (DISCO) ---
 const STORE_DIR = process.env.STORE_DIR || path.join(__dirname, "store");
 const REPLIES_FILE = path.join(STORE_DIR, "pending_replies.json");
 const NOTIFS_FILE = path.join(STORE_DIR, "pending_notifications.json");
+const AGENT_MSGS_FILE = path.join(STORE_DIR, "pending_agent_messages.json");
 
 function ensureStoreDir() {
   try {
@@ -83,6 +87,12 @@ let replySeenKeys = new Set(pendingReplies.map((r) => r?.unique_key).filter(Bool
 let pendingNotifications = loadJsonFile(NOTIFS_FILE, []);
 let notifSeenKeys = new Set(
   pendingNotifications.map((n) => n?.summary?.unique_key).filter(Boolean)
+);
+
+// Mensagens humanas do atendente (duráveis): [{id, created_at, delivered_at, summary, payload}]
+let pendingAgentMessages = loadJsonFile(AGENT_MSGS_FILE, []);
+let agentSeenKeys = new Set(
+  pendingAgentMessages.map((n) => n?.summary?.unique_key).filter(Boolean)
 );
 
 // Cache simples por ticketId p/ enriquecer NewMessage
@@ -234,6 +244,56 @@ function pushNotification(summary, payload) {
   saveJsonFile(NOTIFS_FILE, pendingNotifications);
 }
 
+function cleanupAgentMessages() {
+  const cutoff = Date.now() - AGENT_TTL_HOURS * 60 * 60 * 1000;
+
+  const kept = [];
+  for (const n of pendingAgentMessages) {
+    const t = Date.parse(n?.created_at || "") || 0;
+    if (t >= cutoff) {
+      kept.push(n);
+    } else {
+      const k = n?.summary?.unique_key;
+      if (k) agentSeenKeys.delete(k);
+    }
+  }
+  pendingAgentMessages = kept;
+
+  if (pendingAgentMessages.length > AGENT_MAX) {
+    const removed = pendingAgentMessages.splice(AGENT_MAX);
+    for (const r of removed) {
+      const k = r?.summary?.unique_key;
+      if (k) agentSeenKeys.delete(k);
+    }
+  }
+  saveJsonFile(AGENT_MSGS_FILE, pendingAgentMessages);
+}
+
+function pushAgentMessage(summary, payload) {
+  const unique_key = summary?.unique_key;
+  if (unique_key && agentSeenKeys.has(unique_key)) return;
+
+  const item = {
+    id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
+    created_at: nowIso(),
+    delivered_at: null,
+    summary,
+    payload,
+  };
+
+  pendingAgentMessages.unshift(item);
+  if (unique_key) agentSeenKeys.add(unique_key);
+
+  if (pendingAgentMessages.length > AGENT_MAX) {
+    const removed = pendingAgentMessages.splice(AGENT_MAX);
+    for (const r of removed) {
+      const k = r?.summary?.unique_key;
+      if (k) agentSeenKeys.delete(k);
+    }
+  }
+  saveJsonFile(AGENT_MSGS_FILE, pendingAgentMessages);
+}
+
 function extractTekzapInboundNumber(content) {
   const msg = content?.message;
   if (!msg) return null;
@@ -310,11 +370,13 @@ app.get("/webhook", handleVerify);
 app.get("/health", (_req, res) => {
   cleanupReplies();
   cleanupNotifications();
+  cleanupAgentMessages();
   res.json({
     ok: true,
     time: nowIso(),
     replies_pending: pendingReplies.filter((r) => !r.delivered_at).length,
     notifications_pending: pendingNotifications.filter((n) => !n.delivered_at).length,
+    agent_messages_pending: pendingAgentMessages.filter((n) => !n.delivered_at).length,
   });
 });
 
@@ -427,6 +489,72 @@ app.get("/check-notifications", requirePythonToken, (req, res) => {
   });
 });
 
+// Python busca MENSAGENS HUMANAS DO ATENDENTE (com ACK opcional)
+app.get("/check-agent-messages", requirePythonToken, (req, res) => {
+  cleanupAgentMessages();
+
+  const userEmail = safeLower(req.query.user_email || req.query.userEmail || req.query.email);
+  const mode = (req.query.mode || "my").toString();
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit || "100", 10), 500));
+  const peek = req.query.peek === "1" || req.query.peek === "true";
+  const includeDelivered = req.query.include_delivered === "1" || req.query.include_delivered === "true";
+
+  let items = pendingAgentMessages.slice(0);
+  if (!includeDelivered) {
+    items = items.filter((n) => !n.delivered_at);
+  }
+
+  if (mode === "my" && userEmail) {
+    items = items.filter((n) => {
+      const s = n?.summary || {};
+      const evUser = safeLower(s.user_email);
+      return !evUser || evUser === userEmail;
+    });
+  }
+
+  items = items.slice(0, limit);
+
+  const deliveredAt = nowIso();
+  if (!peek && !includeDelivered) {
+    for (const n of items) n.delivered_at = deliveredAt;
+    saveJsonFile(AGENT_MSGS_FILE, pendingAgentMessages);
+  }
+
+  res.json({
+    count: items.length,
+    delivered_at: peek ? null : deliveredAt,
+    items,
+  });
+});
+
+app.post("/ack-agent-messages", requirePythonToken, (req, res) => {
+  try {
+    const keys = req.body?.unique_keys || req.body?.keys || [];
+    const ids = req.body?.ids || [];
+
+    const keySet = new Set((Array.isArray(keys) ? keys : []).map(String));
+    const idSet = new Set((Array.isArray(ids) ? ids : []).map(String));
+
+    if (keySet.size === 0 && idSet.size === 0) {
+      return res.json({ acked: 0 });
+    }
+
+    const before = pendingAgentMessages.length;
+    pendingAgentMessages = pendingAgentMessages.filter((r) => {
+      const k = r?.summary?.unique_key ? String(r.summary.unique_key) : "";
+      const i = r?.id ? String(r.id) : "";
+      const hit = (k && keySet.has(k)) || (i && idSet.has(i));
+      if (hit && r?.summary?.unique_key) agentSeenKeys.delete(r.summary.unique_key);
+      return !hit;
+    });
+    saveJsonFile(AGENT_MSGS_FILE, pendingAgentMessages);
+
+    return res.json({ acked: before - pendingAgentMessages.length });
+  } catch (e) {
+    return res.status(400).json({ error: "bad_request", detail: String(e?.message || e) });
+  }
+});
+
 // Recebe webhooks
 app.post("/", async (req, res) => {
   // A) Eventos audit enviados pelo Python (Meta send logs etc)
@@ -484,21 +612,21 @@ async function processWebhook(content) {
     if (content && typeof content === "object" && content.event) {
       const event = String(content.event);
 
-      // 1A) Replies inbound (NewMessage)
+      // 1A) NewMessage inbound -> replies | NewMessage fromMe humano -> agent_messages
       if (event === "NewMessage" && content.message) {
         const msg = content.message;
+        const tenantId = content.tenantId ?? msg.tenantId ?? null;
+        const ticketIdRaw = msg.ticketId ?? content?.ticket?.id ?? null;
+        const ticketId = ticketIdRaw != null ? String(ticketIdRaw) : null;
+        const messageId = msg.messageId || msg.id || msg.msgId || msg.msgID || null;
+        const sourceTs = msg.msgCreatedAt || msg.timestamp || msg.createdAt || Date.now();
+        const number = extractTekzapInboundNumber(content);
+        const cached = ticketId ? ticketCache.get(ticketId) || {} : {};
+        const fromMe = isTruthyBoolean(msg.fromMe);
+        const isNote = isTruthyBoolean(msg.note);
 
-        // inbound = NÃO é fromMe (se ausente, consideramos inbound)
-        if (!isTruthyBoolean(msg.fromMe)) {
-          const number = extractTekzapInboundNumber(content);
+        if (!fromMe) {
           if (number) {
-            const tenantId = content.tenantId ?? msg.tenantId ?? null;
-            const ticketId = msg.ticketId ?? null;
-            const messageId =
-              msg.messageId || msg.id || msg.msgId || msg.msgID || null;
-            const sourceTs =
-              msg.msgCreatedAt || msg.timestamp || msg.createdAt || Date.now();
-
             const unique_key = makeUniqueKey({
               event: "reply",
               tenantId,
@@ -510,6 +638,39 @@ async function processWebhook(content) {
             console.log(`[TEKZAP] Cliente ${number} respondeu. Salvando (reply).`);
             pushReply(unique_key, number, content);
           }
+        } else if (!isNote && (msg.userId != null || content?.ticket?.userId != null || content?.ticket?.user?.id != null)) {
+          const unique_key = makeUniqueKey({
+            event: "AgentMessage",
+            tenantId,
+            ticketId,
+            messageId: messageId || stableHash(msg.body || msg.text || msg),
+            sourceTs,
+          });
+
+          const userEmail = safeLower(
+            msg.userEmail ||
+            content?.ticket?.user?.email ||
+            cached.user_email ||
+            ""
+          ) || null;
+
+          pushAgentMessage(
+            {
+              unique_key,
+              tenant_id: tenantId,
+              event: "AgentMessage",
+              ticket_id: ticketId ? parseInt(ticketId, 10) : null,
+              user_id: msg.userId ?? content?.ticket?.userId ?? content?.ticket?.user?.id ?? null,
+              user_email: userEmail,
+              contact_name: cached.contact_name || content?.ticket?.contact?.name || null,
+              contact_number: cached.contact_number || number,
+              last_message: msg.body || msg.text || null,
+              source_timestamp: sourceTs,
+            },
+            content
+          );
+
+          console.log(`[TEKZAP] Mensagem humana fromMe capturada p/ baixa automática. ticket=${ticketId || "?"} user=${userEmail || msg.userId || "?"}`);
         }
       }
 
@@ -667,6 +828,7 @@ setInterval(() => {
   try {
     cleanupReplies();
     cleanupNotifications();
+    cleanupAgentMessages();
   } catch (_) {}
 }, 10 * 60 * 1000);
 
@@ -675,4 +837,5 @@ app.listen(PORT, () => {
   console.log(`🚀 Servidor rodando na porta ${PORT}`);
   console.log(`📨 Replies: /check-replies (suporta ACK em /ack-replies)`);
   console.log(`🔔 Notificações: /check-notifications (token opcional via PYTHON_TOKEN)`);
+  console.log(`👤 Atendente: /check-agent-messages (suporta ACK em /ack-agent-messages)`);
 });
