@@ -172,10 +172,24 @@ function makePresenceViewerKey(userEmail, clientId) {
 }
 
 function makeNotificationAckKey(item, userEmail, clientId) {
-  if (item?.summary?.is_pending === true) {
-    return makeClientViewerKey(clientId) || makeUserViewerKey(userEmail);
-  }
-  return makeUserViewerKey(userEmail) || makeClientViewerKey(clientId);
+  return makeClientViewerKey(clientId) || makeUserViewerKey(userEmail);
+}
+
+function getActiveClientViewerKeys() {
+  cleanupNotifViewers();
+  return Array.from(activeNotifViewers.values())
+    .map((info) => makeClientViewerKey(info?.client_id) || null)
+    .filter(Boolean);
+}
+
+function getActiveClientViewerKeysForUser(userEmail) {
+  const target = safeLower(userEmail);
+  if (!target) return [];
+  cleanupNotifViewers();
+  return Array.from(activeNotifViewers.values())
+    .filter((info) => safeLower(info?.user_email) === target)
+    .map((info) => makeClientViewerKey(info?.client_id) || makeUserViewerKey(info?.user_email) || null)
+    .filter(Boolean);
 }
 
 function cleanupNotifViewers() {
@@ -217,31 +231,37 @@ function getNotificationAckedBy(item) {
 function ensureNotificationAudience(item, userEmail, clientId) {
   if (!item) return false;
 
-  const audience = getNotificationAudience(item);
-  let changed = false;
+  const currentAudience = getNotificationAudience(item);
+  let targetAudience = [];
 
   if (item?.summary?.is_pending === true) {
-    const active = getActiveNotifViewerKeys();
     const requesterKey = makeNotificationAckKey(item, userEmail, clientId);
-    const merged = normalizeStringArray([
-      ...audience,
-      ...active,
+    targetAudience = normalizeStringArray([
+      ...getActiveClientViewerKeys(),
       ...(requesterKey ? [requesterKey] : []),
     ]);
-
-    if (merged.length !== audience.length || merged.some((v, i) => v !== audience[i])) {
-      item.audience = merged;
-      changed = true;
+  } else {
+    const targetEmail = safeLower(item?.summary?.user_email);
+    const requesterMatches = !!targetEmail && safeLower(userEmail) === targetEmail;
+    targetAudience = getActiveClientViewerKeysForUser(targetEmail);
+    if (requesterMatches) {
+      const requesterKey = makeNotificationAckKey(item, userEmail, clientId);
+      targetAudience = normalizeStringArray([
+        ...targetAudience,
+        ...(requesterKey ? [requesterKey] : []),
+      ]);
     }
-    return changed;
+    if (targetAudience.length === 0) {
+      const fallback = targetEmail ? makeUserViewerKey(targetEmail) : makeNotificationAckKey(item, userEmail, clientId);
+      targetAudience = normalizeStringArray(fallback ? [fallback] : []);
+    }
   }
 
-  const target = makeUserViewerKey(item?.summary?.user_email) || makeNotificationAckKey(item, userEmail, clientId) || null;
-  if (!target || audience.includes(target)) return false;
-
-  audience.push(target);
-  item.audience = normalizeStringArray(audience);
-  return true;
+  if (targetAudience.length !== currentAudience.length || targetAudience.some((v, i) => v !== currentAudience[i])) {
+    item.audience = targetAudience;
+    return true;
+  }
+  return false;
 }
 
 function hasViewerAckedNotification(item, viewerKey) {
@@ -371,7 +391,7 @@ function pushNotification(summary, payload) {
     id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
     created_at: nowIso(),
     delivered_at: null,
-    audience: summary?.is_pending === true ? [] : normalizeStringArray([makeUserViewerKey(summary?.user_email)]),
+    audience: [],
     acked_by: [],
     summary,
     payload,
