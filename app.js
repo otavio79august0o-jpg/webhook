@@ -157,12 +157,25 @@ function normalizeStringArray(value) {
   );
 }
 
-function makeViewerKey(userEmail, clientId) {
-  const client = safeLower(clientId);
+function makeUserViewerKey(userEmail) {
   const email = safeLower(userEmail);
-  if (client) return `client:${client}`;
-  if (email) return `user:${email}`;
-  return null;
+  return email ? `user:${email}` : null;
+}
+
+function makeClientViewerKey(clientId) {
+  const client = safeLower(clientId);
+  return client ? `client:${client}` : null;
+}
+
+function makePresenceViewerKey(userEmail, clientId) {
+  return makeClientViewerKey(clientId) || makeUserViewerKey(userEmail);
+}
+
+function makeNotificationAckKey(item, userEmail, clientId) {
+  if (item?.summary?.is_pending === true) {
+    return makeClientViewerKey(clientId) || makeUserViewerKey(userEmail);
+  }
+  return makeUserViewerKey(userEmail) || makeClientViewerKey(clientId);
 }
 
 function cleanupNotifViewers() {
@@ -174,7 +187,7 @@ function cleanupNotifViewers() {
 }
 
 function touchNotifViewer(userEmail, clientId) {
-  const key = makeViewerKey(userEmail, clientId);
+  const key = makePresenceViewerKey(userEmail, clientId);
   if (!key) return null;
 
   activeNotifViewers.set(key, {
@@ -201,7 +214,7 @@ function getNotificationAckedBy(item) {
   return item.acked_by;
 }
 
-function ensureNotificationAudience(item, viewerKey) {
+function ensureNotificationAudience(item, userEmail, clientId) {
   if (!item) return false;
 
   const audience = getNotificationAudience(item);
@@ -210,13 +223,14 @@ function ensureNotificationAudience(item, viewerKey) {
     if (audience.length > 0) return false;
 
     const active = getActiveNotifViewerKeys();
-    if (viewerKey && !active.includes(viewerKey)) active.unshift(viewerKey);
+    const requesterKey = makeNotificationAckKey(item, userEmail, clientId);
+    if (requesterKey && !active.includes(requesterKey)) active.unshift(requesterKey);
 
     item.audience = normalizeStringArray(active);
     return item.audience.length > 0;
   }
 
-  const target = makeViewerKey(item?.summary?.user_email, null) || viewerKey || null;
+  const target = makeUserViewerKey(item?.summary?.user_email) || makeNotificationAckKey(item, userEmail, clientId) || null;
   if (!target || audience.includes(target)) return false;
 
   audience.push(target);
@@ -348,7 +362,7 @@ function pushNotification(summary, payload) {
     id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
     created_at: nowIso(),
     delivered_at: null,
-    audience: summary?.is_pending === true ? [] : normalizeStringArray([makeViewerKey(summary?.user_email, null)]),
+    audience: summary?.is_pending === true ? [] : normalizeStringArray([makeUserViewerKey(summary?.user_email)]),
     acked_by: [],
     summary,
     payload,
@@ -588,7 +602,7 @@ app.get("/check-notifications", requirePythonToken, (req, res) => {
 
   const userEmail = safeLower(req.query.user_email || req.query.userEmail || req.query.email);
   const clientId = safeLower(req.query.client_id || req.query.clientId || req.query.machine_id || req.query.machineId);
-  const viewerKey = touchNotifViewer(userEmail, clientId);
+  const presenceViewerKey = touchNotifViewer(userEmail, clientId);
 
   const mode = (req.query.mode || "my").toString();
   const limit = Math.max(1, Math.min(parseInt(req.query.limit || "100", 10), 500));
@@ -607,21 +621,23 @@ app.get("/check-notifications", requirePythonToken, (req, res) => {
     }
   } // all: sem filtro adicional
 
-  if (viewerKey) {
-    items = items.filter((n) => !hasViewerAckedNotification(n, viewerKey));
-  }
+  items = items.filter((n) => {
+    const ackKey = makeNotificationAckKey(n, userEmail, clientId);
+    return !ackKey || !hasViewerAckedNotification(n, ackKey);
+  });
 
   items = items.slice(0, limit);
 
   let changed = false;
   for (const n of items) {
-    if (ensureNotificationAudience(n, viewerKey)) changed = true;
+    if (ensureNotificationAudience(n, userEmail, clientId)) changed = true;
   }
 
   if (!peek) {
     for (const n of items) {
-      if (viewerKey) {
-        if (markNotificationAcked(n, viewerKey)) changed = true;
+      const ackKey = makeNotificationAckKey(n, userEmail, clientId);
+      if (ackKey) {
+        if (markNotificationAcked(n, ackKey)) changed = true;
       } else if (!n.delivered_at) {
         n.delivered_at = nowIso();
         changed = true;
@@ -635,8 +651,8 @@ app.get("/check-notifications", requirePythonToken, (req, res) => {
 
   res.json({
     count: items.length,
-    delivered_at: !peek && viewerKey ? nowIso() : null,
-    viewer_key: viewerKey,
+    delivered_at: !peek && presenceViewerKey ? nowIso() : null,
+    viewer_key: presenceViewerKey,
     items,
   });
 });
@@ -649,7 +665,7 @@ app.post("/ack-notifications", requirePythonToken, (req, res) => {
     const body = req.body || {};
     const userEmail = safeLower(body.user_email || body.userEmail || body.email || req.query.user_email || req.query.email);
     const clientId = safeLower(body.client_id || body.clientId || body.machine_id || body.machineId || req.query.client_id);
-    const viewerKey = touchNotifViewer(userEmail, clientId);
+    const presenceViewerKey = touchNotifViewer(userEmail, clientId);
 
     const keys = body.unique_keys || body.keys || [];
     const ids = body.ids || [];
@@ -657,12 +673,12 @@ app.post("/ack-notifications", requirePythonToken, (req, res) => {
     const keySet = new Set((Array.isArray(keys) ? keys : []).map(String));
     const idSet = new Set((Array.isArray(ids) ? ids : []).map(String));
 
-    if (!viewerKey) {
+    if (!presenceViewerKey) {
       return res.status(400).json({ error: "viewer_required" });
     }
 
     if (keySet.size === 0 && idSet.size === 0) {
-      return res.json({ acked: 0, fully_delivered: 0, viewer_key: viewerKey });
+      return res.json({ acked: 0, fully_delivered: 0, viewer_key: presenceViewerKey });
     }
 
     let acked = 0;
@@ -675,12 +691,18 @@ app.post("/ack-notifications", requirePythonToken, (req, res) => {
       const hit = (key && keySet.has(key)) || (id && idSet.has(id));
       if (!hit) continue;
 
-      const wasAcked = hasViewerAckedNotification(item, viewerKey);
+      const ackKey = makeNotificationAckKey(item, userEmail, clientId);
+      const wasAcked = ackKey ? hasViewerAckedNotification(item, ackKey) : false;
       const wasDelivered = !!item.delivered_at;
 
-      if (markNotificationAcked(item, viewerKey)) changed = true;
+      if (ackKey) {
+        if (markNotificationAcked(item, ackKey)) changed = true;
+      } else if (!item.delivered_at) {
+        item.delivered_at = nowIso();
+        changed = true;
+      }
 
-      if (!wasAcked && hasViewerAckedNotification(item, viewerKey)) acked += 1;
+      if (ackKey && !wasAcked && hasViewerAckedNotification(item, ackKey)) acked += 1;
       if (!wasDelivered && item.delivered_at) fullyDelivered += 1;
     }
 
@@ -688,7 +710,7 @@ app.post("/ack-notifications", requirePythonToken, (req, res) => {
       saveJsonFile(NOTIFS_FILE, pendingNotifications);
     }
 
-    return res.json({ acked, fully_delivered: fullyDelivered, viewer_key: viewerKey });
+    return res.json({ acked, fully_delivered: fullyDelivered, viewer_key: presenceViewerKey });
   } catch (e) {
     return res.status(400).json({ error: "bad_request", detail: String(e?.message || e) });
   }
