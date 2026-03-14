@@ -218,16 +218,22 @@ function ensureNotificationAudience(item, userEmail, clientId) {
   if (!item) return false;
 
   const audience = getNotificationAudience(item);
+  let changed = false;
 
   if (item?.summary?.is_pending === true) {
-    if (audience.length > 0) return false;
-
     const active = getActiveNotifViewerKeys();
     const requesterKey = makeNotificationAckKey(item, userEmail, clientId);
-    if (requesterKey && !active.includes(requesterKey)) active.unshift(requesterKey);
+    const merged = normalizeStringArray([
+      ...audience,
+      ...active,
+      ...(requesterKey ? [requesterKey] : []),
+    ]);
 
-    item.audience = normalizeStringArray(active);
-    return item.audience.length > 0;
+    if (merged.length !== audience.length || merged.some((v, i) => v !== audience[i])) {
+      item.audience = merged;
+      changed = true;
+    }
+    return changed;
   }
 
   const target = makeUserViewerKey(item?.summary?.user_email) || makeNotificationAckKey(item, userEmail, clientId) || null;
@@ -257,11 +263,14 @@ function isNotificationFullyAcked(item) {
   return audience.every((key) => ackedBy.has(key));
 }
 
-function markNotificationAcked(item, viewerKey) {
-  if (!item || !viewerKey) return false;
+function markNotificationAcked(item, userEmail, clientId) {
+  if (!item) return false;
+
+  const viewerKey = makeNotificationAckKey(item, userEmail, clientId);
+  if (!viewerKey) return false;
 
   let changed = false;
-  if (ensureNotificationAudience(item, viewerKey)) changed = true;
+  if (ensureNotificationAudience(item, userEmail, clientId)) changed = true;
 
   const ackedBy = new Set(getNotificationAckedBy(item));
   if (!ackedBy.has(viewerKey)) {
@@ -637,7 +646,7 @@ app.get("/check-notifications", requirePythonToken, (req, res) => {
     for (const n of items) {
       const ackKey = makeNotificationAckKey(n, userEmail, clientId);
       if (ackKey) {
-        if (markNotificationAcked(n, ackKey)) changed = true;
+        if (markNotificationAcked(n, userEmail, clientId)) changed = true;
       } else if (!n.delivered_at) {
         n.delivered_at = nowIso();
         changed = true;
@@ -696,7 +705,7 @@ app.post("/ack-notifications", requirePythonToken, (req, res) => {
       const wasDelivered = !!item.delivered_at;
 
       if (ackKey) {
-        if (markNotificationAcked(item, ackKey)) changed = true;
+        if (markNotificationAcked(item, userEmail, clientId)) changed = true;
       } else if (!item.delivered_at) {
         item.delivered_at = nowIso();
         changed = true;
